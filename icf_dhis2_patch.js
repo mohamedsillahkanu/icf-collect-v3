@@ -1,5 +1,5 @@
 /**
- * ICF Collect — DHIS2 Patch (single file)  
+ * ICF Collect — DHIS2 Patch (single file)
  * =======================================
  * Load AFTER the app's main script, nothing else needed:
  *   <script src="icf_dhis2_patch.js"></script>
@@ -493,6 +493,68 @@
             subtree: true,
             characterData: true
         });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+
+})();
+
+
+/* ================================================================
+   PART 3 — REMOVE THE OLD PROXY BOX
+   ================================================================
+   The proxy URL is embedded now, so the DHIS2 modal should not ask for it.
+   This deletes that section if an older copy of the earlier script is still
+   loaded somewhere and inserts it. Safe to keep permanently.
+   ================================================================ */
+
+(function () {
+    'use strict';
+
+    var IDS = ['icfProxyUrl', 'icfProxyStatus', 'icfProxySave', 'icfProxyTest'];
+
+    function removeBox() {
+        var input = document.getElementById('icfProxyUrl');
+        if (input) {
+            var section = input.closest ? input.closest('.config-section') : null;
+            if (section) {
+                section.remove();
+            } else if (input.parentNode) {
+                input.parentNode.remove();
+            }
+        }
+        // sweep any stragglers left behind
+        for (var i = 0; i < IDS.length; i++) {
+            var el = document.getElementById(IDS[i]);
+            if (el) { el.remove(); }
+        }
+        // and any section whose title is just "Proxy"
+        var titles = document.querySelectorAll('#dhis2Modal .config-title');
+        for (var j = 0; j < titles.length; j++) {
+            if (titles[j].textContent.trim().toLowerCase() === 'proxy') {
+                var sec = titles[j].closest ? titles[j].closest('.config-section') : null;
+                if (sec) { sec.remove(); }
+            }
+        }
+    }
+
+    function start() {
+        removeBox();
+        new MutationObserver(function () {
+            if (document.getElementById('icfProxyUrl')) { removeBox(); }
+        }).observe(document.body, { childList: true, subtree: true });
+
+        var openBtn = document.querySelector('.header-btn.dhis2');
+        if (openBtn) {
+            openBtn.addEventListener('click', function () {
+                setTimeout(removeBox, 60);
+                setTimeout(removeBox, 300);
+            });
+        }
     }
 
     if (document.readyState === 'loading') {
