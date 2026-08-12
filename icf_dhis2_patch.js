@@ -1,5 +1,5 @@
 /**
- * ICF Collect — DHIS2 Patch (single file)
+ * ICF Collect — DHIS2 Patch (single file)  
  * =======================================
  * Load AFTER the app's main script, nothing else needed:
  *   <script src="icf_dhis2_patch.js"></script>
