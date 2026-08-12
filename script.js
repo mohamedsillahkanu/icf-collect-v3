@@ -291,10 +291,14 @@ async function syncAggregateData() {
     for (const record of aggregateData) {
         const period = record._period;
         const groupValue = record._group;
-        const orgUnitId = state.dhis2.orgUnitMap[groupValue && groupValue.toLowerCase().trim()];
+
+        // Match on the org unit column's own value, never the display label.
+        // The label can be a composite of several grouping columns.
+        const orgUnitValue = record._orgUnit || '';
+        const orgUnitId = state.dhis2.orgUnitMap[orgUnitValue.toLowerCase().trim()];
 
         if (!orgUnitId) {
-            addLog('error', `  ✗ No org unit match: ${groupValue}`);
+            addLog('error', `  ✗ No org unit match: ${orgUnitValue || '(blank)'}`);
             failed++;
             continue;
         }
@@ -358,4 +362,279 @@ async function syncAggregateData() {
     updateDhis2Status('connected', 'Sync complete');
     addLog('info', `Sync complete: ${success} success, ${failed} failed`);
     notify(`Synced ${success} records to DHIS2!`);
+}
+
+// ================================================================
+// 6. GROUPING, DRIVEN BY THE CURRENT FORM
+// ----------------------------------------------------------------
+// You can still group by one or more columns. What changes:
+//
+//   - The saved selection is checked against the form every time it is
+//     read. A column that no longer exists in the form is dropped. That
+//     is what adm1 was: a name left over from an older version of the
+//     form, still ticked, matching nothing, so every record grouped as
+//     "Unknown".
+//   - Nothing is grouped as Unknown any more. A blank value shows as
+//     (blank) in the table.
+//   - Each aggregate row now carries _orgUnit, the raw value of the
+//     Org Unit Column, alongside _group, the display label. The sync
+//     matches on _orgUnit, so you can group by whatever you like
+//     without the sync losing track of the facility.
+//   - The Org Unit Column is always part of the grouping key, so one
+//     row can never span two facilities.
+// ================================================================
+
+// Columns a form field can be grouped by
+function getGroupableFields() {
+    return state.fields.filter(f =>
+        f.type !== 'section' &&
+        ['select', 'radio', 'yesno', 'text'].includes(f.type)
+    );
+}
+
+// Returns the saved grouping columns, minus any that the form no longer has
+function getGroupingColumns() {
+    if (!state.settings) return [];
+
+    let cols = state.settings.aggregateColumns;
+    if (!Array.isArray(cols)) {
+        cols = state.settings.aggregateColumn ? [state.settings.aggregateColumn] : [];
+    }
+
+    const valid = new Set(getGroupableFields().map(f => f.name));
+    const pruned = cols.filter(c => valid.has(c));
+
+    // Write the pruned list back so a stale name cannot survive a reload
+    if (pruned.length !== cols.length) {
+        state.settings.aggregateColumns = pruned;
+        state.settings.aggregateColumn = pruned[0] || '';
+        try { saveToStorage(); } catch (e) {}
+    }
+
+    return pruned;
+}
+
+window.toggleAggregateColumn = function(columnName) {
+    if (!state.settings) return;
+    if (!Array.isArray(state.settings.aggregateColumns)) state.settings.aggregateColumns = [];
+
+    const cols = state.settings.aggregateColumns;
+    const i = cols.indexOf(columnName);
+    if (i >= 0) cols.splice(i, 1);
+    else cols.push(columnName);
+
+    state.settings.aggregateColumn = cols[0] || '';
+    saveToStorage();
+    renderDataContent();
+    renderDashboard();
+};
+
+window.setAggregateColumn = function(columnName) {
+    if (!state.settings) return;
+    state.settings.aggregateColumns = columnName ? [columnName] : [];
+    state.settings.aggregateColumn = columnName || '';
+    saveToStorage();
+    renderDataContent();
+    renderDashboard();
+};
+
+function calculateAggregateData() {
+    const periodColumn = state.dhis2.periodColumn;
+    const orgUnitColumn = state.dhis2.orgUnitColumn;
+    const groupColumns = getGroupingColumns();
+
+    const data = getFilteredData();
+    if (data.length === 0) return [];
+
+    // Key columns: whatever is selected, plus the org unit column so a row
+    // never covers more than one facility
+    const keyColumns = [...groupColumns];
+    if (orgUnitColumn && !keyColumns.includes(orgUnitColumn)) keyColumns.push(orgUnitColumn);
+    if (keyColumns.length === 0) return [];
+
+    const skipFields = [periodColumn, ...keyColumns].filter(Boolean);
+    const skipTypes = ['phone', 'gps', 'email', 'text', 'textarea', 'date', 'time'];
+
+    const cell = v => (v === null || v === undefined ? '' : String(v).trim());
+    const grouped = {};
+
+    data.forEach(record => {
+        let period;
+        if (periodColumn && record[periodColumn]) {
+            period = record[periodColumn];
+        } else {
+            const ts = record._timestamp ? new Date(record._timestamp) : new Date();
+            period = `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}`;
+        }
+
+        const orgUnitValue = orgUnitColumn ? cell(record[orgUnitColumn]) : '';
+
+        // Display label from the selected columns, or the facility if none selected
+        const labelColumns = groupColumns.length > 0 ? groupColumns : (orgUnitColumn ? [orgUnitColumn] : []);
+        const groupValue = labelColumns
+            .map(col => cell(record[col]) || '(blank)')
+            .join(' | ');
+
+        const key = keyColumns.map(col => cell(record[col])).join('|||') + '|||' + period;
+
+        if (!grouped[key]) {
+            grouped[key] = {
+                _group: groupValue,
+                _orgUnit: orgUnitValue,
+                _period: period,
+                _count: 0
+            };
+            keyColumns.forEach(col => {
+                grouped[key]['_grp_' + col] = cell(record[col]);
+            });
+        }
+        grouped[key]._count++;
+
+        state.fields.forEach(field => {
+            if (field.type === 'section') return;
+            if (skipFields.includes(field.name)) return;
+            if (skipTypes.includes(field.type)) return;
+
+            const value = record[field.name];
+            const def = fieldDefs[field.type];
+
+            if (def?.category === 'numeric' || field.type === 'number') {
+                grouped[key][field.name] = (grouped[key][field.name] || 0) + (parseFloat(value) || 0);
+            } else if ((def?.category === 'categorical' || field.type === 'yesno') && field.type !== 'text') {
+                const options = field.type === 'yesno' ? ['Yes', 'No'] : (field.options || []);
+                options.forEach(opt => {
+                    const colName = `${field.name}_${opt}`;
+                    if (grouped[key][colName] === undefined) grouped[key][colName] = 0;
+                });
+                if (value && options.includes(value)) {
+                    const colName = `${field.name}_${value}`;
+                    grouped[key][colName] = (grouped[key][colName] || 0) + 1;
+                }
+            }
+        });
+    });
+
+    return Object.values(grouped);
+}
+
+// ================================================================
+// 7. DATA TAB — GROUP BY PICKER BUILT FROM THE CURRENT FORM
+// ================================================================
+
+function renderDataContent() {
+    const container = document.getElementById('dataContent');
+    if (!container) return;
+
+    try {
+        const orderedFilterFields = getOrderedFilterFields();
+        const filteredData = getFilteredData();
+        const aggregateData = calculateAggregateData();
+        const groupColumns = getGroupingColumns();
+        const groupableFields = getGroupableFields();
+
+        const orgUnitColumn = state.dhis2.orgUnitColumn;
+        const orgUnitField = state.fields.find(f => f.name === orgUnitColumn);
+
+        const activeFilterCount = Object.keys(state.filters).filter(k => state.filters[k]).length +
+                                 (state.dateFilter.start || state.dateFilter.end ? 1 : 0);
+
+        let filtersHtml = `
+            <div class="filter-group">
+                <label class="filter-label"><span class="inline-icon">${getIcon('calendar', 12)}</span> From</label>
+                <input type="date" class="filter-input" value="${state.dateFilter.start}" onchange="updateDateFilter('start', this.value)">
+            </div>
+            <div class="filter-group">
+                <label class="filter-label"><span class="inline-icon">${getIcon('calendar', 12)}</span> To</label>
+                <input type="date" class="filter-input" value="${state.dateFilter.end}" onchange="updateDateFilter('end', this.value)">
+            </div>
+        `;
+
+        orderedFilterFields.forEach(field => {
+            const uniqueValues = [...new Set(state.collectedData.map(d => d[field.name]).filter(Boolean))];
+            filtersHtml += `
+                <div class="filter-group with-arrows">
+                    <button class="filter-arrow-btn left" onclick="moveFilter('${field.name}','up')" title="Move Left">◀</button>
+                    <label class="filter-label">${escapeHtml(field.label)}</label>
+                    <select class="filter-select" onchange="updateFilter('${field.name}', this.value)">
+                        <option value="">All</option>
+                        ${uniqueValues.map(v => `<option value="${escapeHtml(v)}" ${state.filters[field.name] === v ? 'selected' : ''}>${escapeHtml(v)}</option>`).join('')}
+                    </select>
+                    <button class="filter-arrow-btn right" onclick="moveFilter('${field.name}','down')" title="Move Right">▶</button>
+                </div>
+            `;
+        });
+
+        const groupingHtml = `
+            <div class="config-section" style="margin-bottom:15px;padding:12px;">
+                <div style="display:flex;flex-direction:column;gap:8px;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <span class="inline-icon">${getIcon('layers', 14)}</span>
+                        <strong style="font-size:11px;">Group by (fields in this form):</strong>
+                    </div>
+                    ${groupableFields.length === 0 ? `
+                        <span style="font-size:10px;color:#868e96;">No groupable fields in this form yet.</span>
+                    ` : `
+                        <div style="display:flex;flex-wrap:wrap;gap:8px;max-width:600px;">
+                            ${groupableFields.map(f => {
+                                const on = groupColumns.includes(f.name);
+                                return `
+                                    <label style="display:flex;align-items:center;gap:4px;padding:4px 8px;background:${on ? '#004080' : '#f1f3f5'};color:${on ? '#fff' : '#333'};border-radius:4px;cursor:pointer;font-size:11px;">
+                                        <input type="checkbox" value="${f.name}" ${on ? 'checked' : ''} onchange="toggleAggregateColumn('${f.name}')" style="margin:0;">
+                                        ${escapeHtml(f.label)}
+                                    </label>
+                                `;
+                            }).join('')}
+                        </div>
+                    `}
+                    <div style="font-size:10px;">
+                        ${groupColumns.length > 0
+                            ? `<span style="color:#28a745;"><span class="inline-icon">${getIcon('check-circle', 12)}</span> Grouping by: ${groupColumns.map(c => {
+                                   const f = groupableFields.find(x => x.name === c);
+                                   return escapeHtml(f ? f.label : c);
+                               }).join(' + ')} and period</span>`
+                            : (orgUnitColumn
+                                ? `<span style="color:#868e96;">Nothing selected, grouping by ${escapeHtml(orgUnitField?.label || orgUnitColumn)} and period</span>`
+                                : `<span style="color:#856404;">Nothing selected and no Org Unit Column set, so there is nothing to group on</span>`)}
+                    </div>
+                    ${orgUnitColumn ? `
+                        <div style="font-size:10px;color:#868e96;">
+                            Sync matches facilities on <strong>${escapeHtml(orgUnitField?.label || orgUnitColumn)}</strong>, set in DHIS2 Configuration.
+                        </div>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+
+        container.innerHTML = `
+            <div class="filter-panel">
+                <div class="filter-header">
+                    <div class="filter-title"><span class="inline-icon">${getIcon('filter', 14)}</span> Filters ${activeFilterCount > 0 ? `<span class="filter-count">${activeFilterCount} active</span>` : ''}</div>
+                    <button class="filter-btn clear" onclick="clearAllFilters()"><span class="inline-icon">${getIcon('trash-2', 12)}</span> Clear</button>
+                </div>
+                <div class="filter-controls">${filtersHtml}</div>
+            </div>
+
+            ${groupingHtml}
+
+            <div class="data-view-tabs">
+                <div class="data-view-tab ${state.currentDataView === 'case' ? 'active' : ''}" onclick="switchDataView('case')"><span class="inline-icon">${getIcon('list', 14)}</span> Case-Based (${filteredData.length})</div>
+                <div class="data-view-tab ${state.currentDataView === 'aggregate' ? 'active aggregate' : ''}" onclick="switchDataView('aggregate')"><span class="inline-icon">${getIcon('bar-chart-3', 14)}</span> Aggregate (${aggregateData.length})</div>
+            </div>
+
+            <div id="dataTableContainer">${state.currentDataView === 'case' ? renderCaseTable(filteredData) : renderAggregateTable(aggregateData)}</div>
+
+            <div style="margin-top:20px;display:flex;gap:10px;flex-wrap:wrap;">
+                <button class="modal-btn primary" onclick="refreshData()"><span class="inline-icon">${getIcon('refresh-cw', 14)}</span> Refresh</button>
+                <button class="modal-btn success" onclick="downloadCSV()"><span class="inline-icon">${getIcon('download', 14)}</span> Download CSV</button>
+                ${getOfflineCount() > 0 ? `<button class="modal-btn" style="background:#ffc107;color:#000;" onclick="syncOfflineData()"><span class="inline-icon">${getIcon('upload', 14)}</span> Sync Offline (${getOfflineCount()})</button>` : ''}
+                ${state.dhis2.url ? `<button class="modal-btn" style="background:#6f42c1;color:#fff;" onclick="syncCaseBased()"><span class="inline-icon">${getIcon('list', 14)}</span> Sync Case-Based</button>` : ''}
+                ${state.dhis2.url ? `<button class="modal-btn" style="background:#17a2b8;color:#fff;" onclick="syncAggregate()"><span class="inline-icon">${getIcon('bar-chart-3', 14)}</span> Sync Aggregate</button>` : ''}
+            </div>
+        `;
+        initIcons();
+
+    } catch (err) {
+        console.error('Error in renderDataContent:', err);
+        container.innerHTML = `<div style="text-align:center;padding:40px;color:#dc3545;"><p>Error loading data</p><p style="font-size:12px;">${escapeHtml(err.message)}</p></div>`;
+    }
 }
