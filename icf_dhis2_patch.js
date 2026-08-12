@@ -5,6 +5,10 @@
  *   <script src="icf_dhis2_patch.js"></script>
  *
  * Part 1 — DHIS2 proxy client
+ *   The proxy URL is built into this file, so there is nothing to enter
+ *   in the app. If the Apps Script is ever redeployed to a new URL, change
+ *   DEFAULT_PROXY_URL below.
+ *
  *   Speaks the deployed proxy's own contract:
  *     ?url=<encoded DHIS2 url>&method=GET|POST|PUT|PATCH|DELETE&auth=<base64>
  *   Every request is a POST with Content-Type text/plain, which stays a simple
@@ -36,6 +40,10 @@
 (function () {
     'use strict';
 
+    // Deployed Apps Script web app. Nothing to enter in the app.
+    // Replace this line if the proxy is ever redeployed to a new URL.
+    var DEFAULT_PROXY_URL = 'https://script.google.com/macros/s/AKfycbyFerPTDjmYuCuBqfKqvdmfQ-ZozR4_wxwt4ScoPwweNHtWm-HZlyqZPzJs7_9XH7GD/exec';
+
     var PROXY_KEY = 'icf_dhis2_proxy_url';
     var CONN_KEY  = 'icf_dhis2_connection';
     var PAGE_SIZE = 300;
@@ -51,7 +59,7 @@
     }
 
     function getProxyUrl() {
-        return (lsGet(PROXY_KEY) || '').trim();
+        return (lsGet(PROXY_KEY) || DEFAULT_PROXY_URL || '').trim();
     }
 
     function setProxyUrl(url) {
@@ -356,70 +364,6 @@
         });
     }
 
-    /* ---------- UI: proxy section in the DHIS2 modal ---------- */
-
-    function status(text, kind) {
-        var el = document.getElementById('icfProxyStatus');
-        if (!el) { return; }
-        el.textContent = text;
-        el.style.display = 'block';
-        if (kind === 'ok') {
-            el.style.background = '#d4edda';
-            el.style.color = '#155724';
-        } else if (kind === 'err') {
-            el.style.background = '#f8d7da';
-            el.style.color = '#721c24';
-        } else {
-            el.style.background = '#fff3cd';
-            el.style.color = '#856404';
-        }
-    }
-
-    function injectProxySection() {
-        var modal = document.getElementById('dhis2Modal');
-        if (!modal || document.getElementById('icfProxyUrl')) { return; }
-
-        var anchor = modal.querySelector('.config-section');
-        if (!anchor) { return; }
-
-        var box = document.createElement('div');
-        box.className = 'config-section';
-        box.innerHTML =
-            '<div class="config-title">Proxy</div>' +
-            '<label class="config-label">Apps Script Web App URL (ends in /exec)</label>' +
-            '<input type="url" class="config-input" id="icfProxyUrl" ' +
-            'placeholder="https://script.google.com/macros/s/AKfycb.../exec">' +
-            '<div id="icfProxyStatus" style="display:none;padding:10px;border-radius:6px;' +
-            'font-size:12px;margin-top:10px;"></div>' +
-            '<div style="display:flex;gap:10px;margin-top:12px;">' +
-            '<button class="modal-btn" id="icfProxySave" style="flex:1;">Save proxy URL</button>' +
-            '<button class="modal-btn" id="icfProxyTest" style="flex:1;">Check proxy</button>' +
-            '</div>';
-
-        anchor.parentNode.insertBefore(box, anchor);
-
-        document.getElementById('icfProxyUrl').value = getProxyUrl();
-
-        document.getElementById('icfProxySave').onclick = function () {
-            var url = setProxyUrl(document.getElementById('icfProxyUrl').value);
-            status(url ? 'Proxy URL saved.' : 'Proxy URL cleared.', url ? 'ok' : 'warn');
-        };
-
-        document.getElementById('icfProxyTest').onclick = function () {
-            setProxyUrl(document.getElementById('icfProxyUrl').value);
-            status('Checking proxy...', 'warn');
-            ping().then(function (res) {
-                if (res && res.ok) {
-                    status('Proxy is reachable. Version ' + (res.version || 'unknown') + '.', 'ok');
-                } else {
-                    status('Proxy replied but not as expected: ' + JSON.stringify(res), 'err');
-                }
-            }).catch(function (err) {
-                status(err.message, 'err');
-            });
-        };
-    }
-
     /* ---------- connection test through the proxy ---------- */
 
     function setDhis2Status(text, cls) {
@@ -452,15 +396,6 @@
     /* ---------- wire up ---------- */
 
     function boot() {
-        injectProxySection();
-
-        var openBtn = document.querySelector('.header-btn.dhis2');
-        if (openBtn) {
-            openBtn.addEventListener('click', function () {
-                setTimeout(injectProxySection, 50);
-            });
-        }
-
         window.testDhis2Connection = testDhis2Connection;
     }
 
