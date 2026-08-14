@@ -1520,7 +1520,29 @@
             const level = state.dhis2.orgUnitLevel;
             addLog('info', `Fetching org units at level ${level}...`);
             
-            const result = await dhis2Request(`organisationUnits.json?fields=id,name,displayName,code&filter=level:eq:${level}&paging=false`);
+            // Paged. One paging=false response for a whole level comes back
+            // truncated through the Apps Script proxy, which read as
+            // "Invalid response" and then "All proxies failed".
+            const pageSize = 300;
+            const collected = [];
+            let pageNo = 1, pageCount = 1, result = null;
+
+            while (pageNo <= pageCount && pageNo <= 60) {
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    result = await dhis2Request(`organisationUnits.json?fields=id,name,displayName,code&filter=level:eq:${level}&pageSize=${pageSize}&page=${pageNo}&order=name:asc`);
+                    if (result.success && result.data?.organisationUnits) break;
+                    if (attempt < 3) await sleep(1500);
+                }
+                if (!result || !result.success || !result.data?.organisationUnits) break;
+
+                collected.push(...result.data.organisationUnits);
+                pageCount = result.data.pager?.pageCount || 1;
+                pageNo++;
+            }
+
+            if (collected.length > 0) {
+                result = { success: true, data: { organisationUnits: collected } };
+            }
             
             if (result.success && result.data?.organisationUnits) {
                 state.dhis2.orgUnits = result.data.organisationUnits;
@@ -2365,10 +2387,10 @@
                 
                 if (result.success) {
                     success++;
-                    addLog('success', `  ✓ Synced: ${orgUnitName} / ${period}`);
+                    addLog('success', `  ✓ Synced: ${groupValue} / ${period}`);
                 } else {
                     failed++;
-                    addLog('error', `  ✗ Failed: ${orgUnitName} / ${period}`);
+                    addLog('error', `  ✗ Failed: ${groupValue} / ${period}`);
                 }
                 
                 await sleep(300);
@@ -2565,14 +2587,11 @@
             const periodColumn = state.dhis2.periodColumn;
             const orgUnitColumn = state.dhis2.orgUnitColumn;
             
-            // Support both legacy single column and new multi-column
-            let aggregateColumns = state.settings.aggregateColumns || [];
-            if (aggregateColumns.length === 0 && state.settings.aggregateColumn) {
-                aggregateColumns = [state.settings.aggregateColumn];
-            }
-            if (aggregateColumns.length === 0 && orgUnitColumn) {
-                aggregateColumns = [orgUnitColumn];
-            }
+            // Grouping removed. Aggregation is always by the Org Unit Column,
+            // the same field the sync matches facilities on. Anything stored in
+            // settings.aggregateColumns is ignored, which is what left adm1
+            // selected after the form changed and blocked the push to DHIS2.
+            let aggregateColumns = orgUnitColumn ? [orgUnitColumn] : [];
             
             // If no aggregation column set, use default grouping by month
             const useDefaultGrouping = aggregateColumns.length === 0 && !periodColumn;
@@ -2607,7 +2626,10 @@
                     
                     // Build composite group value from multiple columns
                     if (aggregateColumns.length > 0) {
-                        const groupParts = aggregateColumns.map(col => record[col] || 'Unknown');
+                        const groupParts = aggregateColumns.map(col => String(record[col] || '').trim());
+                        // No facility value means nowhere to send it. Skipped rather
+                        // than collected into an "Unknown" row that fails at sync.
+                        if (groupParts.some(v => !v)) return;
                         groupValue = groupParts.join(' | ');
                     } else {
                         groupValue = 'All';
@@ -3758,6 +3780,40 @@
             }).join('');
         }
         
+        // Draws one side of a comparison: a fixed number, or another field in
+        // the form. Used for cross-field rules like Age >= Minimum Age.
+        function renderCompareSide(rule, idx, prop, placeholder) {
+            const current = state.fields.find(f => f.id === state.selectedFieldId);
+            const compareTo = rule.compareTo === 'field' ? 'field' : 'value';
+
+            // Fields that can hold a comparable value
+            const others = state.fields.filter(f =>
+                f.type !== 'section' &&
+                f.id !== (current && current.id) &&
+                ['number', 'calculation', 'date', 'rating'].includes(f.type)
+            );
+
+            const modeSelect = `
+                <select class="logic-select" style="max-width:95px;" onchange="updateValidationRule(${idx}, 'compareTo', this.value)">
+                    <option value="value" ${compareTo === 'value' ? 'selected' : ''}>a number</option>
+                    <option value="field" ${compareTo === 'field' ? 'selected' : ''}>another field</option>
+                </select>`;
+
+            if (compareTo === 'field') {
+                if (others.length === 0) {
+                    return modeSelect + `<span style="font-size:9px;color:#856404;">No other number or date field to compare with</span>`;
+                }
+                return modeSelect + `
+                    <select class="logic-select" style="flex:1;" onchange="updateValidationRule(${idx}, 'compareField', this.value)">
+                        <option value="">-- Select field --</option>
+                        ${others.map(f => `<option value="${f.name}" ${rule.compareField === f.name ? 'selected' : ''}>${escapeHtml(f.label)}</option>`).join('')}
+                    </select>`;
+            }
+
+            return modeSelect + `
+                <input type="number" class="logic-input" placeholder="${placeholder}" value="${rule[prop] || ''}" onchange="updateValidationRule(${idx}, '${prop}', this.value)">`;
+        }
+
         function renderNumericValidation(rules) {
             if (!rules || rules.length === 0) {
                 return '<p style="font-size:10px;color:#868e96;text-align:center;padding:10px;">No validation rules.</p>';
@@ -3777,11 +3833,11 @@
                             <option value="between" ${rule.operator === 'between' ? 'selected' : ''}>between</option>
                         </select>
                         ${rule.operator === 'between' ? `
-                            <input type="number" class="logic-input" placeholder="min" value="${rule.min || ''}" onchange="updateValidationRule(${idx}, 'min', this.value)">
+                            ${renderCompareSide(rule, idx, 'min', 'min')}
                             <span style="font-size:10px;">and</span>
-                            <input type="number" class="logic-input" placeholder="max" value="${rule.max || ''}" onchange="updateValidationRule(${idx}, 'max', this.value)">
+                            ${renderCompareSide(rule, idx, 'max', 'max')}
                         ` : `
-                            <input type="number" class="logic-input" placeholder="value" value="${rule.value || ''}" onchange="updateValidationRule(${idx}, 'value', this.value)">
+                            ${renderCompareSide(rule, idx, 'value', 'value')}
                         `}
                         <button class="logic-rule-delete" onclick="deleteValidationRule(${idx})">✕</button>
                     </div>
@@ -3894,6 +3950,8 @@
             
             field.validation.push({
                 operator: '>=',
+                compareTo: 'value',   // 'value' = a fixed number, 'field' = another field
+                compareField: '',     // name of the other field when compareTo is 'field'
                 value: '',
                 min: '',
                 max: '',
@@ -4011,6 +4069,46 @@
             return false;
         }
         
+        // Reads the live value of another field in the open form, so a rule can
+        // compare one answer against another instead of a fixed number.
+        function otherFieldValue(fieldName) {
+            const form = document.getElementById('viewerForm');
+            if (!form || !fieldName) return null;
+
+            const el = form.querySelector(`[name="${fieldName}"]`);
+            if (!el) return null;
+
+            const raw = String(el.value || '').trim();
+            if (!raw) return null;
+
+            const other = state.fields.find(f => f.name === fieldName);
+            if (other && other.type === 'date') {
+                const t = new Date(raw).getTime();
+                return isNaN(t) ? null : t;
+            }
+            const num = parseFloat(raw);
+            return isNaN(num) ? null : num;
+        }
+
+        // What a rule compares against: another field's value, or a fixed number.
+        // Returns null when the other field is empty, so the rule waits instead
+        // of failing on a half-filled form.
+        function ruleComparand(rule, prop) {
+            if (rule.compareTo === 'field') {
+                return otherFieldValue(rule.compareField);
+            }
+            const num = parseFloat(rule[prop]);
+            return isNaN(num) ? null : num;
+        }
+
+        function ruleComparandLabel(rule, prop) {
+            if (rule.compareTo === 'field') {
+                const other = state.fields.find(f => f.name === rule.compareField);
+                return other ? other.label : rule.compareField;
+            }
+            return rule[prop];
+        }
+
         function validateField(field, value) {
             if (value === '' || value === null || value === undefined) {
                 return { valid: true, message: '' }; // Don't validate empty (use required for that)
@@ -4028,27 +4126,28 @@
                         let valid = true;
                         
                         if (rule.operator === 'between') {
-                            const min = parseFloat(rule.min);
-                            const max = parseFloat(rule.max);
-                            valid = !isNaN(min) && !isNaN(max) && num >= min && num <= max;
+                            const min = ruleComparand(rule, 'min');
+                            const max = ruleComparand(rule, 'max');
+                            // Nothing to compare with yet, so nothing to fail
+                            if (min === null || max === null) continue;
+                            valid = num >= min && num <= max;
                         } else {
-                            const comp = parseFloat(rule.value);
-                            if (!isNaN(comp)) {
-                                switch (rule.operator) {
-                                    case '>': valid = num > comp; break;
-                                    case '>=': valid = num >= comp; break;
-                                    case '<': valid = num < comp; break;
-                                    case '<=': valid = num <= comp; break;
-                                    case '=': valid = num === comp; break;
-                                    case '!=': valid = num !== comp; break;
-                                }
+                            const comp = ruleComparand(rule, 'value');
+                            if (comp === null) continue;
+                            switch (rule.operator) {
+                                case '>': valid = num > comp; break;
+                                case '>=': valid = num >= comp; break;
+                                case '<': valid = num < comp; break;
+                                case '<=': valid = num <= comp; break;
+                                case '=': valid = num === comp; break;
+                                case '!=': valid = num !== comp; break;
                             }
                         }
                         
                         if (!valid) {
                             const defaultMsg = rule.operator === 'between' 
-                                ? `Value must be between ${rule.min} and ${rule.max}`
-                                : `Value must be ${rule.operator} ${rule.value}`;
+                                ? `Value must be between ${ruleComparandLabel(rule, 'min')} and ${ruleComparandLabel(rule, 'max')}`
+                                : `Value must be ${rule.operator} ${ruleComparandLabel(rule, 'value')}`;
                             return { valid: false, message: rule.message || defaultMsg };
                         }
                     }
@@ -5327,8 +5426,7 @@
                             input = `<div class="viewer-radio-group">${(field.options||[]).map((o, idx) => `<label class="viewer-radio-option"><input type="checkbox" name="${field.name}" value="${escapeHtml(o)}"><span>${escapeHtml(o)}</span></label>`).join('')}</div>`;
                             break;
                         case 'gps':
-                            input = `<div><button type="button" onclick="captureGPS(this)" style="padding:10px 20px;background:#004080;color:white;border:none;border-radius:6px;cursor:pointer;"><span data-icon="map-pin" data-size="14"></span> Get Location</button><input type="hidden" name="${field.name}"><div class="gps-status" style="margin-top:6px;font-size:11px;"></div>
-                `;
+                            input = `<div class="gps-container"><button type="button" onclick="captureGPS(this)" style="padding:10px 20px;background:#004080;color:white;border:none;border-radius:6px;cursor:pointer;"><span data-icon="map-pin" data-size="14"></span> Get Location</button><input type="hidden" name="${field.name}"><div class="gps-status" style="margin-top:6px;font-size:11px;"></div></div>`;
                             break;
                         case 'qrcode':
                             input = `<div class="qr-scanner-container">
@@ -5859,38 +5957,6 @@
                 `;
             });
             
-            // Build aggregate column options (categorical fields that can be used for grouping)
-            const aggregatableFields = state.fields.filter(f => 
-                ['select', 'radio', 'yesno', 'text'].includes(f.type) && f.type !== 'section'
-            );
-            const selectedColumns = state.settings.aggregateColumns || [];
-            const aggregateColumnHtml = `
-                <div class="config-section" style="margin-bottom:15px;padding:12px;">
-                    <div style="display:flex;align-items:flex-start;gap:15px;flex-wrap:wrap;">
-                        <div style="display:flex;flex-direction:column;gap:8px;">
-                            <div style="display:flex;align-items:center;gap:8px;">
-                                <span class="inline-icon">${getIcon('layers', 14)}</span>
-                                <strong style="font-size:11px;">Aggregate By (select one or more):</strong>
-                            </div>
-                            <div style="display:flex;flex-wrap:wrap;gap:8px;max-width:500px;">
-                                ${aggregatableFields.map(f => `
-                                    <label style="display:flex;align-items:center;gap:4px;padding:4px 8px;background:${selectedColumns.includes(f.name) ? '#004080' : '#f1f3f5'};color:${selectedColumns.includes(f.name) ? '#fff' : '#333'};border-radius:4px;cursor:pointer;font-size:11px;">
-                                        <input type="checkbox" value="${f.name}" ${selectedColumns.includes(f.name) ? 'checked' : ''} onchange="toggleAggregateColumn('${f.name}')" style="margin:0;">
-                                        ${escapeHtml(f.label)}
-                                    </label>
-                                `).join('')}
-                            </div>
-                        </div>
-                        <div style="font-size:10px;color:#28a745;">
-                            ${selectedColumns.length > 0 ? `<span class="inline-icon">${getIcon('check-circle', 12)}</span> Grouping by: ${selectedColumns.map(c => {
-                                const field = aggregatableFields.find(f => f.name === c);
-                                return field ? field.label : c;
-                            }).join(' + ')}` : '<span style="color:#868e96;">Select columns to group data</span>'}
-                        </div>
-                    </div>
-                </div>
-            `;
-            
             container.innerHTML = `
                 <div class="filter-panel">
                     <div class="filter-header">
@@ -5899,8 +5965,6 @@
                     </div>
                     <div class="filter-controls">${filtersHtml}</div>
                 </div>
-                
-                ${aggregateColumnHtml}
                 
                 <div class="data-view-tabs">
                     <div class="data-view-tab ${state.currentDataView === 'case' ? 'active' : ''}" onclick="switchDataView('case')"><span class="inline-icon">${getIcon('list', 14)}</span> Case-Based (${filteredData.length})</div>
@@ -7194,7 +7258,7 @@
         }
 
         window.captureGPS = function(btn) {
-            const container = btn.parentElement;
+            const container = btn.closest('.gps-container') || btn.parentElement;
             const status = container.querySelector('.gps-status');
             const input = container.querySelector('input[type="hidden"]');
             status.innerHTML = '<span class="inline-icon">' + getIcon('loader', 12) + '</span> Getting location...';
