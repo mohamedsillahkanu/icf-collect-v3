@@ -1577,6 +1577,45 @@
             document.getElementById('trackerConfig').style.display = mode === 'tracker' ? 'block' : 'none';
         }
 
+        // Checks the saved DHIS2 column settings against the form. A column that is
+        // no longer a field in the form is cleared, so the dropdown comes up empty
+        // and you choose. Nothing is picked automatically: the Org Unit Column is
+        // whatever you select in DHIS2 Configuration.
+        //
+        // This is what adm1 was, a column saved against an older version of the
+        // form. Left in place it matched nothing, so every record aggregated to a
+        // blank facility and no data could be pushed.
+        function autoFixDhis2Columns() {
+            if (!state.fields || state.fields.length === 0) return false;
+
+            const names = new Set(state.fields.filter(f => f.type !== 'section').map(f => f.name));
+            const cleared = [];
+
+            if (state.dhis2.orgUnitColumn && !names.has(state.dhis2.orgUnitColumn)) {
+                cleared.push(`Org Unit Column "${state.dhis2.orgUnitColumn}" is not a field in this form, so it was cleared. Choose one in DHIS2 Configuration.`);
+                state.dhis2.orgUnitColumn = '';
+            }
+
+            if (state.dhis2.periodColumn && !names.has(state.dhis2.periodColumn)) {
+                cleared.push(`Period Column "${state.dhis2.periodColumn}" is not a field in this form, so it was cleared. Choose one in DHIS2 Configuration.`);
+                state.dhis2.periodColumn = '';
+            }
+
+            state.dhis2.columnFixes = cleared;
+            if (cleared.length === 0) return false;
+
+            // Persist without touching the modal inputs, which may not be on screen
+            try {
+                const saved = JSON.parse(safeStorage.getItem('icfDhis2Config') || '{}');
+                saved.orgUnitColumn = state.dhis2.orgUnitColumn;
+                saved.periodColumn = state.dhis2.periodColumn;
+                safeStorage.setItem('icfDhis2Config', JSON.stringify(saved));
+            } catch (e) {}
+
+            cleared.forEach(c => console.log('[DHIS2 config] ' + c));
+            return true;
+        }
+
         function saveDhis2Config() {
             state.dhis2.url = document.getElementById('dhis2Url').value.trim();
             state.dhis2.username = document.getElementById('dhis2Username').value.trim();
@@ -2298,6 +2337,11 @@
         async function syncAggregateData() {
             addLog('info', 'Syncing AGGREGATE data to DHIS2...');
             updateDhis2Status('syncing', 'Syncing...');
+
+            // Repair stale column settings before the guard below rejects them
+            if (autoFixDhis2Columns()) {
+                (state.dhis2.columnFixes || []).forEach(c => addLog('info', c));
+            }
             
             // Check if DHIS2 columns are configured
             if (!state.dhis2.periodColumn || !state.dhis2.orgUnitColumn) {
@@ -2584,20 +2628,39 @@
 
         // ==================== DATA AGGREGATION ====================
         function calculateAggregateData() {
-            const periodColumn = state.dhis2.periodColumn;
-            const orgUnitColumn = state.dhis2.orgUnitColumn;
+            let periodColumn = state.dhis2.periodColumn;
+            let orgUnitColumn = state.dhis2.orgUnitColumn;
             
-            // Grouping removed. Aggregation is always by the Org Unit Column,
-            // the same field the sync matches facilities on. Anything stored in
-            // settings.aggregateColumns is ignored, which is what left adm1
-            // selected after the form changed and blocked the push to DHIS2.
-            let aggregateColumns = orgUnitColumn ? [orgUnitColumn] : [];
+            // Aggregation is always by the Org Unit Column, the same field the
+            // sync matches facilities on. settings.aggregateColumns is ignored.
+            //
+            // A column configured against an older version of the form counts as
+            // unset. adm1 was exactly that: still selected in DHIS2
+            // Configuration, matching no field in the form, so every record had a
+            // blank value and the aggregate view came out empty.
+            autoFixDhis2Columns();
+            const orgUnitColumnFixed = state.dhis2.orgUnitColumn;
+
+            const formFieldNames = new Set(state.fields.filter(f => f.type !== 'section').map(f => f.name));
+            orgUnitColumn = orgUnitColumnFixed;
+            periodColumn = state.dhis2.periodColumn;
+            const orgUnitColumnValid = !!(orgUnitColumn && formFieldNames.has(orgUnitColumn));
+
+            state.aggregateInfo = {
+                orgUnitColumn: orgUnitColumn || '',
+                orgUnitColumnValid: orgUnitColumnValid,
+                skippedNoOrgUnit: 0,
+                totalRecords: 0
+            };
+
+            let aggregateColumns = orgUnitColumnValid ? [orgUnitColumn] : [];
             
             // If no aggregation column set, use default grouping by month
             const useDefaultGrouping = aggregateColumns.length === 0 && !periodColumn;
             
             const grouped = {};
             const data = getFilteredData();
+            state.aggregateInfo.totalRecords = data.length;
             
             if (data.length === 0) return [];
             
@@ -2629,7 +2692,10 @@
                         const groupParts = aggregateColumns.map(col => String(record[col] || '').trim());
                         // No facility value means nowhere to send it. Skipped rather
                         // than collected into an "Unknown" row that fails at sync.
-                        if (groupParts.some(v => !v)) return;
+                        if (groupParts.some(v => !v)) {
+                            state.aggregateInfo.skippedNoOrgUnit++;
+                            return;
+                        }
                         groupValue = groupParts.join(' | ');
                     } else {
                         groupValue = 'All';
@@ -2822,6 +2888,7 @@
 
         // ==================== UI HELPERS ====================
         function openDhis2Config() {
+            autoFixDhis2Columns();
             document.getElementById('dhis2Url').value = state.dhis2.url || '';
             document.getElementById('dhis2Username').value = state.dhis2.username || '';
             document.getElementById('dhis2Password').value = state.dhis2.password || '';
@@ -5957,6 +6024,30 @@
                 `;
             });
             
+            // Says why the aggregate view is empty instead of leaving a blank table
+            const aggInfo = state.aggregateInfo || {};
+            const aggField = state.fields.find(f => f.name === aggInfo.orgUnitColumn);
+            let aggNote;
+
+            if (!aggInfo.orgUnitColumn) {
+                aggNote = `<span style="color:#856404;">No Org Unit Column set. Open DHIS2 Configuration and choose the field that holds the facility.</span>`;
+            } else if (!aggInfo.orgUnitColumnValid) {
+                aggNote = `<span style="color:#cc0000;">Org Unit Column is set to <strong>${escapeHtml(aggInfo.orgUnitColumn)}</strong>, which is not a field in this form. Open DHIS2 Configuration and pick a field that exists.</span>`;
+            } else if (aggregateData.length === 0 && aggInfo.skippedNoOrgUnit > 0) {
+                aggNote = `<span style="color:#cc0000;">${aggInfo.skippedNoOrgUnit} of ${aggInfo.totalRecords} record(s) have no value in <strong>${escapeHtml(aggField?.label || aggInfo.orgUnitColumn)}</strong>, so there is nothing to aggregate.</span>`;
+            } else {
+                aggNote = `<span>One row per <strong>${escapeHtml(aggField?.label || aggInfo.orgUnitColumn)}</strong> per period.${(state.dhis2.columnFixes || []).length ? ` ${escapeHtml(state.dhis2.columnFixes.join('. '))}.` : ''}${aggInfo.skippedNoOrgUnit > 0 ? ` ${aggInfo.skippedNoOrgUnit} record(s) skipped for having no facility value.` : ''} Change the column in DHIS2 Configuration.</span>`;
+            }
+
+            const aggNoteHtml = `
+                <div class="config-section" style="margin-bottom:15px;padding:10px 12px;">
+                    <div style="display:flex;align-items:flex-start;gap:8px;font-size:11px;line-height:1.5;">
+                        <span class="inline-icon">${getIcon('layers', 14)}</span>
+                        ${aggNote}
+                    </div>
+                </div>
+            `;
+
             container.innerHTML = `
                 <div class="filter-panel">
                     <div class="filter-header">
@@ -5965,6 +6056,8 @@
                     </div>
                     <div class="filter-controls">${filtersHtml}</div>
                 </div>
+                
+                ${aggNoteHtml}
                 
                 <div class="data-view-tabs">
                     <div class="data-view-tab ${state.currentDataView === 'case' ? 'active' : ''}" onclick="switchDataView('case')"><span class="inline-icon">${getIcon('list', 14)}</span> Case-Based (${filteredData.length})</div>
