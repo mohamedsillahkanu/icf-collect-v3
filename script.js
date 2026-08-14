@@ -20,6 +20,9 @@
 //      in that function. It threw a ReferenceError on the first record
 //      and stopped the sync.
 //   5. addLog can hide log lines you do not want to see.
+//   6. Grouping removed. Aggregate rows are one facility and one period,
+//      taken from the Org Unit Column in DHIS2 Configuration. The old
+//      saved column list, including adm1, is deleted from storage.
 // ================================================================
 
 // ---------- 1. Proxy ----------
@@ -284,7 +287,6 @@ async function syncAggregateData() {
 
     const periodColumn = state.dhis2.periodColumn;
     const orgUnitColumn = state.dhis2.orgUnitColumn;
-    const aggregateColumn = state.settings.aggregateColumn || orgUnitColumn;
 
     let success = 0, failed = 0;
 
@@ -308,7 +310,7 @@ async function syncAggregateData() {
         const dataFields = state.fields.filter(f =>
             f.type !== 'section' &&
             f.name !== periodColumn &&
-            f.name !== aggregateColumn &&
+            f.name !== orgUnitColumn &&
             !skipTypes.includes(f.type)
         );
 
@@ -365,100 +367,94 @@ async function syncAggregateData() {
 }
 
 // ================================================================
-// 6. GROUPING, DRIVEN BY THE CURRENT FORM
+// 6. GROUPING REMOVED
 // ----------------------------------------------------------------
-// You can still group by one or more columns. What changes:
+// One aggregate row per facility per period, and the facility comes
+// from the Org Unit Column in DHIS2 Configuration, the same field the
+// sync matches on. There is no separate column list to fall out of
+// step with the form.
 //
-//   - The saved selection is checked against the form every time it is
-//     read. A column that no longer exists in the form is dropped. That
-//     is what adm1 was: a name left over from an older version of the
-//     form, still ticked, matching nothing, so every record grouped as
-//     "Unknown".
-//   - Nothing is grouped as Unknown any more. A blank value shows as
-//     (blank) in the table.
-//   - Each aggregate row now carries _orgUnit, the raw value of the
-//     Org Unit Column, alongside _group, the display label. The sync
-//     matches on _orgUnit, so you can group by whatever you like
-//     without the sync losing track of the facility.
-//   - The Org Unit Column is always part of the grouping key, so one
-//     row can never span two facilities.
+// adm1 came from that separate list. It survived in saved settings
+// after the form changed, matched no field, produced a group called
+// Unknown, and the sync then had nothing to look up. The purge below
+// deletes that list from the current form, from icfCollectForm and
+// from every entry in icfCollectForms, so it cannot come back on the
+// next load.
 // ================================================================
 
-// Columns a form field can be grouped by
-function getGroupableFields() {
-    return state.fields.filter(f =>
-        f.type !== 'section' &&
-        ['select', 'radio', 'yesno', 'text'].includes(f.type)
-    );
-}
+function purgeGroupingSettings() {
+    let touched = false;
 
-// Returns the saved grouping columns, minus any that the form no longer has
-function getGroupingColumns() {
-    if (!state.settings) return [];
-
-    let cols = state.settings.aggregateColumns;
-    if (!Array.isArray(cols)) {
-        cols = state.settings.aggregateColumn ? [state.settings.aggregateColumn] : [];
+    if (state.settings) {
+        if (state.settings.aggregateColumn) { state.settings.aggregateColumn = ''; touched = true; }
+        if (state.settings.aggregateColumns && state.settings.aggregateColumns.length) {
+            state.settings.aggregateColumns = [];
+            touched = true;
+        }
     }
 
-    const valid = new Set(getGroupableFields().map(f => f.name));
-    const pruned = cols.filter(c => valid.has(c));
+    // Current form in storage
+    try {
+        const raw = safeStorage.getItem('icfCollectForm');
+        if (raw) {
+            const obj = JSON.parse(raw);
+            if (obj.settings && (obj.settings.aggregateColumn || (obj.settings.aggregateColumns || []).length)) {
+                obj.settings.aggregateColumn = '';
+                obj.settings.aggregateColumns = [];
+                safeStorage.setItem('icfCollectForm', JSON.stringify(obj));
+            }
+        }
+    } catch (e) {}
 
-    // Write the pruned list back so a stale name cannot survive a reload
-    if (pruned.length !== cols.length) {
-        state.settings.aggregateColumns = pruned;
-        state.settings.aggregateColumn = pruned[0] || '';
+    // Every saved form
+    try {
+        const forms = JSON.parse(safeStorage.getItem('icfCollectForms') || '[]');
+        let changed = false;
+        forms.forEach(f => {
+            if (f.settings && (f.settings.aggregateColumn || (f.settings.aggregateColumns || []).length)) {
+                f.settings.aggregateColumn = '';
+                f.settings.aggregateColumns = [];
+                changed = true;
+            }
+        });
+        if (changed) safeStorage.setItem('icfCollectForms', JSON.stringify(forms));
+    } catch (e) {}
+
+    if (touched) {
         try { saveToStorage(); } catch (e) {}
     }
-
-    return pruned;
 }
 
-window.toggleAggregateColumn = function(columnName) {
-    if (!state.settings) return;
-    if (!Array.isArray(state.settings.aggregateColumns)) state.settings.aggregateColumns = [];
-
-    const cols = state.settings.aggregateColumns;
-    const i = cols.indexOf(columnName);
-    if (i >= 0) cols.splice(i, 1);
-    else cols.push(columnName);
-
-    state.settings.aggregateColumn = cols[0] || '';
-    saveToStorage();
-    renderDataContent();
-    renderDashboard();
-};
-
-window.setAggregateColumn = function(columnName) {
-    if (!state.settings) return;
-    state.settings.aggregateColumns = columnName ? [columnName] : [];
-    state.settings.aggregateColumn = columnName || '';
-    saveToStorage();
-    renderDataContent();
-    renderDashboard();
-};
+// The picker is gone. These stay defined so any leftover onclick in the
+// page cannot throw.
+window.toggleAggregateColumn = function() { purgeGroupingSettings(); };
+window.setAggregateColumn = function() { purgeGroupingSettings(); };
 
 function calculateAggregateData() {
+    purgeGroupingSettings();
+
     const periodColumn = state.dhis2.periodColumn;
     const orgUnitColumn = state.dhis2.orgUnitColumn;
-    const groupColumns = getGroupingColumns();
 
     const data = getFilteredData();
     if (data.length === 0) return [];
 
-    // Key columns: whatever is selected, plus the org unit column so a row
-    // never covers more than one facility
-    const keyColumns = [...groupColumns];
-    if (orgUnitColumn && !keyColumns.includes(orgUnitColumn)) keyColumns.push(orgUnitColumn);
-    if (keyColumns.length === 0) return [];
+    // Without an Org Unit Column there is nothing to aggregate to
+    if (!orgUnitColumn) return [];
 
-    const skipFields = [periodColumn, ...keyColumns].filter(Boolean);
+    const skipFields = [periodColumn, orgUnitColumn].filter(Boolean);
     const skipTypes = ['phone', 'gps', 'email', 'text', 'textarea', 'date', 'time'];
 
-    const cell = v => (v === null || v === undefined ? '' : String(v).trim());
     const grouped = {};
 
     data.forEach(record => {
+        const raw = record[orgUnitColumn];
+        const orgUnitValue = raw === null || raw === undefined ? '' : String(raw).trim();
+
+        // No facility value means nowhere to send it. Skipped rather than
+        // collected into a row that would fail at sync time.
+        if (!orgUnitValue) return;
+
         let period;
         if (periodColumn && record[periodColumn]) {
             period = record[periodColumn];
@@ -467,26 +463,15 @@ function calculateAggregateData() {
             period = `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}`;
         }
 
-        const orgUnitValue = orgUnitColumn ? cell(record[orgUnitColumn]) : '';
-
-        // Display label from the selected columns, or the facility if none selected
-        const labelColumns = groupColumns.length > 0 ? groupColumns : (orgUnitColumn ? [orgUnitColumn] : []);
-        const groupValue = labelColumns
-            .map(col => cell(record[col]) || '(blank)')
-            .join(' | ');
-
-        const key = keyColumns.map(col => cell(record[col])).join('|||') + '|||' + period;
+        const key = `${orgUnitValue}|||${period}`;
 
         if (!grouped[key]) {
             grouped[key] = {
-                _group: groupValue,
+                _group: orgUnitValue,
                 _orgUnit: orgUnitValue,
                 _period: period,
                 _count: 0
             };
-            keyColumns.forEach(col => {
-                grouped[key]['_grp_' + col] = cell(record[col]);
-            });
         }
         grouped[key]._count++;
 
@@ -518,7 +503,7 @@ function calculateAggregateData() {
 }
 
 // ================================================================
-// 7. DATA TAB — GROUP BY PICKER BUILT FROM THE CURRENT FORM
+// 7. DATA TAB WITHOUT THE GROUP BY PICKER
 // ================================================================
 
 function renderDataContent() {
@@ -526,11 +511,11 @@ function renderDataContent() {
     if (!container) return;
 
     try {
+        purgeGroupingSettings();
+
         const orderedFilterFields = getOrderedFilterFields();
         const filteredData = getFilteredData();
         const aggregateData = calculateAggregateData();
-        const groupColumns = getGroupingColumns();
-        const groupableFields = getGroupableFields();
 
         const orgUnitColumn = state.dhis2.orgUnitColumn;
         const orgUnitField = state.fields.find(f => f.name === orgUnitColumn);
@@ -564,43 +549,13 @@ function renderDataContent() {
             `;
         });
 
-        const groupingHtml = `
-            <div class="config-section" style="margin-bottom:15px;padding:12px;">
-                <div style="display:flex;flex-direction:column;gap:8px;">
-                    <div style="display:flex;align-items:center;gap:8px;">
-                        <span class="inline-icon">${getIcon('layers', 14)}</span>
-                        <strong style="font-size:11px;">Group by (fields in this form):</strong>
-                    </div>
-                    ${groupableFields.length === 0 ? `
-                        <span style="font-size:10px;color:#868e96;">No groupable fields in this form yet.</span>
-                    ` : `
-                        <div style="display:flex;flex-wrap:wrap;gap:8px;max-width:600px;">
-                            ${groupableFields.map(f => {
-                                const on = groupColumns.includes(f.name);
-                                return `
-                                    <label style="display:flex;align-items:center;gap:4px;padding:4px 8px;background:${on ? '#004080' : '#f1f3f5'};color:${on ? '#fff' : '#333'};border-radius:4px;cursor:pointer;font-size:11px;">
-                                        <input type="checkbox" value="${f.name}" ${on ? 'checked' : ''} onchange="toggleAggregateColumn('${f.name}')" style="margin:0;">
-                                        ${escapeHtml(f.label)}
-                                    </label>
-                                `;
-                            }).join('')}
-                        </div>
-                    `}
-                    <div style="font-size:10px;">
-                        ${groupColumns.length > 0
-                            ? `<span style="color:#28a745;"><span class="inline-icon">${getIcon('check-circle', 12)}</span> Grouping by: ${groupColumns.map(c => {
-                                   const f = groupableFields.find(x => x.name === c);
-                                   return escapeHtml(f ? f.label : c);
-                               }).join(' + ')} and period</span>`
-                            : (orgUnitColumn
-                                ? `<span style="color:#868e96;">Nothing selected, grouping by ${escapeHtml(orgUnitField?.label || orgUnitColumn)} and period</span>`
-                                : `<span style="color:#856404;">Nothing selected and no Org Unit Column set, so there is nothing to group on</span>`)}
-                    </div>
-                    ${orgUnitColumn ? `
-                        <div style="font-size:10px;color:#868e96;">
-                            Sync matches facilities on <strong>${escapeHtml(orgUnitField?.label || orgUnitColumn)}</strong>, set in DHIS2 Configuration.
-                        </div>
-                    ` : ''}
+        const noteHtml = `
+            <div class="config-section" style="margin-bottom:15px;padding:10px 12px;">
+                <div style="display:flex;align-items:center;gap:8px;font-size:11px;">
+                    <span class="inline-icon">${getIcon('layers', 14)}</span>
+                    ${orgUnitColumn
+                        ? `<span>One row per <strong>${escapeHtml(orgUnitField?.label || orgUnitColumn)}</strong> per period. Change the column in DHIS2 Configuration.</span>`
+                        : `<span style="color:#856404;">No Org Unit Column set. Choose one in DHIS2 Configuration to see aggregate rows.</span>`}
                 </div>
             </div>
         `;
@@ -614,7 +569,7 @@ function renderDataContent() {
                 <div class="filter-controls">${filtersHtml}</div>
             </div>
 
-            ${groupingHtml}
+            ${noteHtml}
 
             <div class="data-view-tabs">
                 <div class="data-view-tab ${state.currentDataView === 'case' ? 'active' : ''}" onclick="switchDataView('case')"><span class="inline-icon">${getIcon('list', 14)}</span> Case-Based (${filteredData.length})</div>
@@ -638,3 +593,7 @@ function renderDataContent() {
         container.innerHTML = `<div style="text-align:center;padding:40px;color:#dc3545;"><p>Error loading data</p><p style="font-size:12px;">${escapeHtml(err.message)}</p></div>`;
     }
 }
+
+// Run the purge as soon as this file loads, so adm1 is gone before
+// anything reads the settings.
+try { purgeGroupingSettings(); } catch (e) {}
